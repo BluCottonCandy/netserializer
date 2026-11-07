@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2015 Tomi Valkeinen
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -24,6 +24,64 @@ namespace NetSerializer
 	{
 		private const int StringByteBufferLength = 256;
 		private const int StringCharBufferLength = 128;
+
+		// Lengths come from untrusted serialized data. Validate before allocating, not
+		// after Read() discovers that the advertised payload never existed.
+		private static void ValidatePayloadLength(Stream stream, uint length)
+		{
+			if (length > int.MaxValue)
+				throw new InvalidDataException("Serialized payload exceeds supported length.");
+			if (stream.CanSeek && length > stream.Length - stream.Position)
+				throw new InvalidDataException("Serialized payload exceeds remaining data.");
+		}
+
+		private static void ValidateStringLength(Stream stream, uint bytes, uint chars)
+		{
+			if (chars == 0 || chars > bytes)
+				throw new InvalidDataException("Invalid serialized UTF-8 character count.");
+			ValidatePayloadLength(stream, bytes);
+		}
+
+		private static byte[] ReadPayload(Stream stream, uint length)
+		{
+			ValidatePayloadLength(stream, length);
+			if (stream.CanSeek)
+			{
+				var result = new byte[(int)length];
+				var offset = 0;
+				while (offset < result.Length)
+				{
+					var read = stream.Read(result, offset, result.Length - offset);
+					if (read == 0) throw new EndOfStreamException();
+					offset += read;
+				}
+				return result;
+			}
+
+			// No trustworthy remaining-length information: grow only as actual data
+			// arrives. A forged prefix alone must not reserve the claimed capacity.
+			using (var result = new MemoryStream())
+			{
+				var buffer = new byte[4096];
+				var remaining = length;
+				while (remaining > 0)
+				{
+					var read = stream.Read(buffer, 0, (int)Math.Min((uint)buffer.Length, remaining));
+					if (read == 0) throw new EndOfStreamException();
+					result.Write(buffer, 0, read);
+					remaining -= (uint)read;
+				}
+				return result.ToArray();
+			}
+		}
+
+		private static string ReadUnseekableString(Stream stream, uint bytes, uint chars)
+		{
+			var value = new UTF8Encoding(false, true).GetString(ReadPayload(stream, bytes));
+			if (value.Length != chars)
+				throw new InvalidDataException("Serialized UTF-8 character count does not match payload.");
+			return value;
+		}
 
 		public static MethodInfo GetWritePrimitive(Type type)
 		{
@@ -548,6 +606,13 @@ namespace NetSerializer
 
 			ReadPrimitive(stream, out uint totalChars);
 
+			ValidateStringLength(stream, totalBytes, totalChars);
+			if (!stream.CanSeek)
+			{
+				value = ReadUnseekableString(stream, totalBytes, totalChars);
+				return;
+			}
+
 			value = string.Create((int) totalChars, ((int) totalBytes, stream), _stringSpanRead);
 		}
 
@@ -591,13 +656,15 @@ namespace NetSerializer
 					// This copy should be fine because we're only ever gonna be copying up to 4 bytes
 					// from the end of the buffer to the start.
 					// So no chance of overlap.
-					buf[bytesRead..].CopyTo(buf);
-					writeBufStart = bytesReadLeft - bytesRead;
+					buf.Slice(bytesRead, readFromStream - bytesRead).CopyTo(buf);
+					writeBufStart = readFromStream - bytesRead;
 					continue;
 				}
 
 				Debug.Assert(status == OperationStatus.Done);
 			}
+			if (totalCharsRead != span.Length)
+				throw new InvalidDataException("Serialized UTF-8 character count does not match payload.");
 		}
 #elif NO_UNSAFE
 		public static void WritePrimitive(Stream stream, string value)
@@ -648,6 +715,13 @@ namespace NetSerializer
 
 			len -= 1;
 
+			ValidateStringLength(stream, len, totalChars);
+			if (!stream.CanSeek)
+			{
+				value = ReadUnseekableString(stream, len, totalChars);
+				return;
+			}
+
 			var encoding = new UTF8Encoding(false, true);
 
 			var buf = new byte[len];
@@ -663,6 +737,8 @@ namespace NetSerializer
 			}
 
 			value = encoding.GetString(buf);
+			if (value.Length != totalChars)
+				throw new InvalidDataException("Serialized UTF-8 character count does not match payload.");
 		}
 #else
 		sealed class StringHelper
@@ -760,6 +836,13 @@ namespace NetSerializer
 			uint totalChars;
 			ReadPrimitive(stream, out totalChars);
 
+			ValidateStringLength(stream, totalBytes, totalChars);
+			if (!stream.CanSeek)
+			{
+				value = ReadUnseekableString(stream, totalBytes, totalChars);
+				return;
+			}
+
 			var helper = s_stringHelper;
 			if (helper == null)
 				s_stringHelper = helper = new StringHelper();
@@ -804,6 +887,8 @@ namespace NetSerializer
 				}
 			}
 
+			if (cp != totalChars)
+				throw new InvalidDataException("Serialized UTF-8 character count does not match payload.");
 			value = new string(chars, 0, (int)totalChars);
 		}
 #endif
@@ -841,16 +926,7 @@ namespace NetSerializer
 
 			len -= 1;
 
-			value = new byte[len];
-			int l = 0;
-
-			while (l < len)
-			{
-				int r = stream.Read(value, l, (int)len - l);
-				if (r == 0)
-					throw new EndOfStreamException();
-				l += r;
-			}
+			value = ReadPayload(stream, len);
 		}
 	}
 }
